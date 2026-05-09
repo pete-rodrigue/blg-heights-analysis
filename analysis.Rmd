@@ -1,6 +1,6 @@
 ---
 title: "building heights analysis"
-author: "pete rodrigue"
+author: "Pete Rodrigue, Spence Ainsworth"
 date: "`r Sys.Date()`"
 output: html_document
 ---
@@ -19,6 +19,7 @@ library(patchwork)
 library(plotly)
 library(here)
 library(httr)
+library(tidyr)
 
 
 # load data that has the dates the historic districts were designated
@@ -28,7 +29,227 @@ hd_data <- readr::read_csv("https://docs.google.com/spreadsheets/d/1Ajl1iAS0NRB7
 hd_shp <- st_read("https://maps2.dcgis.dc.gov/dcgis/rest/services/DCGIS_DATA/Historic_WebMercator/MapServer/6/query?outFields=*&where=1%3D1&f=geojson")
 
 # Merge historic district (HD) data onto HD shapefile, subset to only look at neighborhood HDs:
-hd_shp <- dplyr::left_join(x = hd_shp, y = hd_data, by = "UNIQUEID")
-hd_shp <- hd_shp %>% filter(Neighborhood_HD==1)
+historic_districts <- dplyr::left_join(x = hd_shp, y = hd_data, by = "UNIQUEID")
+historic_districts <- historic_districts %>% filter(Neighborhood_HD==1)
+
+
+buildings <- st_read("data/DC_buildings_height_2024_MEAN.json")
+
 ```
 
+
+```{r}
+# Project to UTM Zone 18N (meters) so distances are meaningful
+crs_m <- 32618
+buildings          <- st_transform(buildings, crs_m)
+historic_districts <- st_transform(historic_districts, crs_m)
+
+# Add a unique building ID for tracking
+buildings <- buildings %>% mutate(bldg_id = row_number())
+
+district_name_col = "LABEL"
+height_col        = "bldg_ht_m"
+
+# ── Use building centroids for cleaner point-in-polygon logic ───────────────
+# (avoids edge cases where large buildings straddle a boundary)
+building_centroids <- buildings %>%
+  mutate(geometry = st_centroid(geometry))
+
+# ── Create 100m band on both sides of each district boundary ───────────────
+boundary_bands <- historic_districts %>%
+  select(district = all_of(district_name_col)) %>%
+  mutate(geometry = st_buffer(st_boundary(geometry), dist = 100))
+
+# ── Find all buildings within the 100m band (either side) ──────────────────
+near_boundary <- st_join(
+  building_centroids %>% select(bldg_id, all_of(height_col)),
+  boundary_bands,
+  join = st_intersects
+) %>%
+  filter(!is.na(district)) %>%
+  st_drop_geometry()
+
+# ── Identify buildings inside each specific district ───────────────────────
+inside <- st_join(
+  building_centroids %>% select(bldg_id),
+  historic_districts %>% select(district = all_of(district_name_col)),
+  join = st_within
+) %>%
+  filter(!is.na(district)) %>%
+  st_drop_geometry() %>%
+  mutate(inside_district = TRUE)
+
+# ── Flag buildings inside ANY historic district ───────────────────────
+inside_any <- inside %>%
+  distinct(bldg_id) %>%
+  mutate(inside_any_district = TRUE)
+
+# ── Join, label, and filter ────────────────────────────────────────────────
+results <- near_boundary %>%
+  left_join(inside,     by = c("bldg_id", "district")) %>%
+  left_join(inside_any, by = "bldg_id") %>%
+  mutate(
+    inside_district     = coalesce(inside_district,     FALSE),
+    inside_any_district = coalesce(inside_any_district, FALSE),
+    location = if_else(
+      inside_district,
+      "Inside (≤100m from boundary)",
+      "Outside (≤100m from boundary)"
+    )
+  ) %>%
+  filter(
+    inside_district |        # always keep inside buildings
+    !inside_any_district     # only keep outside buildings if not in ANY district
+  )
+
+# ── Summarise by district ──────────────────────────────────────────────────
+summary_table <- results %>%
+  group_by(district, location) %>%
+  summarise(
+    mean_height_m = mean(.data[[height_col]], na.rm = TRUE),
+    n_buildings   = n(),
+    .groups       = "drop"
+  ) %>%
+  arrange(district, location)
+
+# print(summary_table)
+
+# ── Wide format for side-by-side comparison ────────────────────────────────
+summary_wide <- summary_table %>%
+  tidyr::pivot_wider(
+    names_from  = location,
+    values_from = c(mean_height_m, n_buildings)
+  ) %>%
+  janitor::clean_names() %>%
+  mutate(height_difference_m = mean_height_m_inside_100m_from_boundary -
+                                mean_height_m_outside_100m_from_boundary) %>%
+  arrange(desc(abs(height_difference_m)))
+
+# print(summary_wide)
+
+```
+
+```{r, fig.height=12, fig.width=8, out.width="100%"}
+ggplot(summary_table, aes(x = reorder(district, mean_height_m), 
+                           y = mean_height_m, 
+                           fill = location)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = paste0("n=", n_buildings)),
+            position = position_dodge(width = 0.9),
+            hjust     = -0.1,
+            size      = 3) +
+  scale_fill_manual(values = c(
+    "Inside (≤100m from boundary)"  = "#619CFF",
+    "Outside (≤100m from boundary)" = "#F8766D"
+  )) +
+  coord_flip() +
+  labs(
+    title    = "Mean Building Height Near Historic District Boundaries",
+    subtitle = "Comparing buildings within 100m inside vs. outside each district",
+    x        = NULL,
+    y        = "Mean Height (m)",
+    fill     = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position  = "bottom",
+    panel.grid.major.y = element_blank()
+  )
+```
+
+```{r, fig.height=10, fig.width=10, out.width="100%"}
+
+scatter_data <- summary_table %>%
+  pivot_wider(
+    names_from  = location,
+    values_from = c(mean_height_m, n_buildings)
+  ) %>%
+  janitor::clean_names() %>%
+  # average n_buildings across inside/outside for point sizing
+  mutate(n_buildings_avg = (n_buildings_inside_100m_from_boundary + 
+                             n_buildings_outside_100m_from_boundary) / 2) %>%
+  mutate(district = stringr::str_remove(string = district, pattern = " HD"))
+
+ggplot(scatter_data, 
+       aes(x = mean_height_m_outside_100m_from_boundary,
+           y = mean_height_m_inside_100m_from_boundary,
+           size = n_buildings_avg,
+           label = district)) +
+  # 45-degree reference line (where inside == outside)
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey40") +
+  geom_point(alpha = 0.7, color = "#619CFF") +
+  ggrepel::geom_label_repel(size = 3, max.overlaps = 20) +
+  scale_size_continuous(range = c(2, 12), name = "Avg. # Buildings") +
+  labs(
+    title    = "Mean Building Height Inside vs. Outside Historic District Boundaries",
+    subtitle = "Points above the dotted line = taller inside than outside; size = number of buildings",
+    x        = "Mean Height Outside (m)",
+    y        = "Mean Height Inside (m)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+```
+
+
+```{r, fig.height=7, fig.width=9, out.width="100%"}
+scatter_data %>%
+  mutate(
+    height_difference_m = mean_height_m_inside_100m_from_boundary -
+                          mean_height_m_outside_100m_from_boundary
+  ) %>%
+  ggplot(aes(x = reorder(district, height_difference_m),
+             y = height_difference_m,
+             fill = height_difference_m > 0)) +
+  geom_col() +
+  geom_hline(yintercept = 0, color = "grey40") +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "#619CFF", "FALSE" = "#F8766D"),
+    labels = c("TRUE" = "Taller inside", "FALSE" = "Taller outside"),
+    name   = NULL
+  ) +
+  labs(
+    title    = "Difference in Mean Building Height: Inside vs. Outside Historic Districts",
+    subtitle = "Positive values = taller inside the district; negative = taller outside",
+    x        = NULL,
+    y        = "Height Difference (m)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position    = "bottom",
+    panel.grid.major.y = element_blank()
+  )
+
+```
+
+
+```{r, out.width="100%"}
+
+summary_table %>%
+  group_by(location) %>%
+  summarise(mean_height_ft = mean(mean_height_m, na.rm = TRUE) * 3.28084) %>%
+  ggplot(aes(x = location, y = mean_height_ft, fill = location)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = round(mean_height_ft)),
+            vjust = -0.5,
+            size  = 5) +
+  scale_fill_manual(values = c(
+    "Inside (≤100m from boundary)"  = "#619CFF",
+    "Outside (≤100m from boundary)" = "#F8766D"
+  )) +
+  labs(
+    title = "Mean Building Height Inside vs. Outside Historic Districts",
+    x     = NULL,
+    y     = "Mean Height (ft)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position   = "none",
+    panel.grid.major  = element_blank(),
+    panel.grid.minor  = element_blank(),
+    axis.text.y = element_blank()
+  ) +
+  ylim(c(0, 42))
+
+```
