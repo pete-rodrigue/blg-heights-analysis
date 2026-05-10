@@ -195,25 +195,26 @@ ggplot(scatter_data,
 ```{r, fig.height=7, fig.width=9, out.width="100%"}
 scatter_data %>%
   mutate(
-    height_difference_m = mean_height_m_inside_100m_from_boundary -
-                          mean_height_m_outside_100m_from_boundary
+    height_difference_ft = (mean_height_m_outside_100m_from_boundary -
+                          mean_height_m_inside_100m_from_boundary) *
+                          3.28084
   ) %>%
-  ggplot(aes(x = reorder(district, height_difference_m),
-             y = height_difference_m,
-             fill = height_difference_m > 0)) +
+  ggplot(aes(x = reorder(district, height_difference_ft),
+             y = height_difference_ft,
+             fill = height_difference_ft > 0)) +
   geom_col() +
   geom_hline(yintercept = 0, color = "grey40") +
   coord_flip() +
   scale_fill_manual(
     values = c("TRUE" = "#619CFF", "FALSE" = "#F8766D"),
-    labels = c("TRUE" = "Taller inside", "FALSE" = "Taller outside"),
+    labels = c("TRUE" = "Taller outside", "FALSE" = "Taller inside"),
     name   = NULL
   ) +
   labs(
     title    = "Difference in Mean Building Height: Inside vs. Outside Historic Districts",
-    subtitle = "Positive values = taller inside the district; negative = taller outside",
+    subtitle = "Positive values = taller outside the district; negative = taller inside",
     x        = NULL,
-    y        = "Height Difference (m)"
+    y        = "Height Difference (ft)"
   ) +
   theme_minimal(base_size = 13) +
   theme(
@@ -235,8 +236,8 @@ summary_table %>%
             vjust = -0.5,
             size  = 5) +
   scale_fill_manual(values = c(
-    "Inside (≤100m from boundary)"  = "#619CFF",
-    "Outside (≤100m from boundary)" = "#F8766D"
+    "Inside (≤100m from boundary)"  = "#F8766D",
+    "Outside (≤100m from boundary)" = "#619CFF"
   )) +
   labs(
     title = "Mean Building Height Inside vs. Outside Historic Districts",
