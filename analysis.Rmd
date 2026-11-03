@@ -237,7 +237,7 @@ b <-
   ) +
   labs(
     title    = "",# "Difference in Mean Building Height: Inside vs. Outside Historic Districts",
-    subtitle = "Positive values = taller outside the district\nnegative = taller inside",
+    subtitle = "",# "Positive values = taller outside the district\nnegative = taller inside",
     x        = NULL,
     y        = "Height Difference (ft)"
   ) +
